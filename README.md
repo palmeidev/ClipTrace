@@ -42,13 +42,28 @@ Construído para oferecer alto desempenho com consumo mínimo de memória e proc
 | Ação | Atalho |
 |---|---|
 | Abrir / Fechar Janela | `Ctrl + Shift + V` ou `Alt + V` |
+| Abrir com o atalho do Windows | `Win + V` (opcional em Configurações, enquanto o ClipTrace estiver em execução) |
 | Navegar no Histórico | `Setas Cima / Baixo` |
-| Copiar Selecionado | `Enter` ou clique duplo |
+| Copiar Selecionado | `Enter` ou clique no cartão |
 | Detalhes do Registro | Clique no botão de informações (`i`) |
 | Fixar / Desafixar Registro | Clique no botão de pino |
 | Fechar Janela | `Esc` |
 
 O ClipTrace permanece acessível na área de notificação da barra de tarefas (System Tray). Um clique duplo abre a janela principal e o botão direito exibe opções rápidas para pausar monitoramento, limpar histórico, abrir configurações ou encerrar o aplicativo.
+
+## Atualizações
+
+O ClipTrace verifica as releases publicadas do repositório ao iniciar e, enquanto estiver aberto, a cada hora. Quando existe uma versão mais recente, uma notificação oferece o download; a opção também fica disponível no menu da bandeja. O download só começa após o clique.
+
+O atualizador exige que a release contenha `ClipTrace.exe` para x64 com digest SHA-256 e que a propriedade `ProductVersion` do executável corresponda à tag da release (sem o prefixo `v`). Depois de verificar o download, um processo auxiliar espera o ClipTrace encerrar, substitui o executável mantendo uma cópia de segurança e abre a versão nova. A pasta onde o programa está instalado precisa permitir gravação pelo usuário; se não permitir, a instalação automática informa o erro e reabre a versão anterior.
+
+Para validar o atualizador sem instalar nada:
+
+```powershell
+MSBuild.exe tests\ClipTraceUpdatesTests.vcxproj /p:Configuration=Release /p:Platform=x64
+.\tests\x64\Release\ClipTraceUpdatesTests.exe --live
+.\tests\x64\Release\ClipTraceUpdatesTests.exe --install-smoke
+```
 
 ---
 

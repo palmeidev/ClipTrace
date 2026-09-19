@@ -13,6 +13,8 @@
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'"><ClCompile><WarningLevel>Level3</WarningLevel><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions><SDLCheck>true</SDLCheck><LanguageStandard>stdcpp20</LanguageStandard><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions></ClCompile><Link><SubSystem>Windows</SubSystem><EnableCOMDATFolding>true</EnableCOMDATFolding><OptimizeReferences>true</OptimizeReferences></Link><ResourceCompile><AdditionalIncludeDirectories>$(SolutionDir)assets;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories></ResourceCompile></ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp" />
+    <ClCompile Include="updates.cpp" />
+    <ClInclude Include="updates.h" />
     <ClInclude Include="icons.h" />
     <ClInclude Include="resource.h" />
     <ResourceCompile Include="ClipTrace.rc" />

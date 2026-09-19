@@ -6,8 +6,8 @@ IDR_LOGO RCDATA "logo.png"
 IDR_DEVELOPER RCDATA "developer.png"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION 1,0,0,0
-PRODUCTVERSION 1,0,0,0
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
 FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
 FILEFLAGS 0x1L
@@ -24,12 +24,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "palmeidev"
             VALUE "FileDescription", "ClipTrace - Gerenciador de Area de Transferencia"
-            VALUE "FileVersion", "1.0-preview"
+            VALUE "FileVersion", "1.1-preview"
             VALUE "InternalName", "ClipTrace.exe"
             VALUE "LegalCopyright", "Copyright (C) Pablo Almeida (palmeidev)"
             VALUE "OriginalFilename", "ClipTrace.exe"
             VALUE "ProductName", "ClipTrace"
-            VALUE "ProductVersion", "1.0-preview"
+            VALUE "ProductVersion", "1.1-preview"
         END
     END
     BLOCK "VarFileInfo"

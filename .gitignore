@@ -7,6 +7,9 @@
 *.VC.db
 *.VC.opendb
 *.opendb
+*.VC.db-shm
+*.VC.db-wal
+ipch/
 
 # Build output directories
 x64/
@@ -34,6 +37,10 @@ dist/
 *.log
 *.recipe
 *.manifest
+*.tmp
+*.bak
+*.pfx
+TestResults/
 
 # Windows system files
 [Dd]esktop.ini

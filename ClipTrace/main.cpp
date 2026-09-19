@@ -17,6 +17,7 @@
 #include <vector>
 #include <cstdint>
 #include "resource.h"
+#include "updates.h"
 namespace Gdiplus {
     using std::min;
     using std::max;
@@ -75,6 +76,7 @@ std::wstring gSearchQuery = L"";
 int gScrollOffset = 0;
 
 constexpr UINT kGlobalHotkeyId = 1001;
+constexpr UINT WM_OPEN_CLIPTRACE = WM_APP + 3;
 constexpr UINT WM_TRAYICON = WM_APP + 2;
 constexpr UINT IDM_TRAY_OPEN = 2001;
 constexpr UINT IDM_TRAY_PAUSE = 2002;
@@ -82,6 +84,8 @@ constexpr UINT IDM_TRAY_CLEAR = 2003;
 constexpr UINT IDM_TRAY_SETTINGS = 2004;
 constexpr UINT IDM_TRAY_EXIT = 2005;
 constexpr UINT IDM_TRAY_ABOUT = 2006;
+constexpr UINT IDM_TRAY_UPDATE = 2007;
+constexpr UINT WM_INSTALL_UPDATE = WM_APP + 7;
 
 Gdiplus::Bitmap* gLogoBitmap = nullptr;
 Gdiplus::Bitmap* gDeveloperBitmap = nullptr;
@@ -95,6 +99,16 @@ enum class HistoryRetention {
 };
 HistoryRetention gRetentionSetting = HistoryRetention::Never;
 bool gStartWithWindows = true;
+bool gReplaceWinV = false;
+HHOOK gWinVHook = nullptr;
+HWND gMainWindow = nullptr;
+bool gWinKeyDown = false;
+bool gWinVDown = false;
+bool gCtrlDown = false;
+bool gAltDown = false;
+std::unique_ptr<ClipTraceUpdates::Release> gAvailableUpdate;
+winrt::Windows::UI::Notifications::ToastNotification gUpdateToast{nullptr};
+bool gUpdateBalloonActive = false;
 
 struct ClipItem {
     std::wstring preview;
@@ -114,7 +128,6 @@ std::vector<RECT> gCardRects;
 int gSelectedIndex = 0;
 NOTIFYICONDATAW gTrayIcon{};
 HICON gLargeAppIcon = nullptr;
-bool gIgnoreClipboardUpdate = false;
 
 struct DetailDialogState {
     ClipItem item;
@@ -146,17 +159,22 @@ struct SettingsDialogState {
     RECT retentionTabs[5]{};
     RECT autoStartRowRect{};
     RECT autoStartSwitchRect{};
+    RECT winVRowRect{};
+    RECT winVSwitchRect{};
 
     bool closeHovered = false;
     bool clearHovered = false;
     int tabHovered = -1;
     bool switchHovered = false;
+    bool winVHovered = false;
 
     float closeHoverProgress = 0.0f;
     float clearHoverProgress = 0.0f;
     float tabHoverProgress[5]{ 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
     float switchToggleProgress = 0.0f;
     float switchHoverProgress = 0.0f;
+    float winVToggleProgress = 0.0f;
+    float winVHoverProgress = 0.0f;
 
     int targetX = 0;
     int targetY = 0;
@@ -176,6 +194,7 @@ void SaveSettings();
 void LoadSettings();
 bool IsAutoStartEnabled();
 void SetAutoStartEnabled(bool enable);
+bool SetWinVReplacement(bool enable);
 bool ApplyAutoCleanup();
 void ClearAllHistory();
 void ShowSettings(HWND hwnd);
@@ -470,7 +489,7 @@ std::vector<size_t> GetFilteredIndices() {
 
     for (size_t i = 0; i < gHistory.size(); ++i) {
         const auto& it = gHistory[i];
-        std::wstring pLower = it.preview;
+        std::wstring pLower = it.preview + L" " + it.rawContent;
         for (auto& c : pLower) c = towlower(c);
         std::wstring sLower = it.source;
         for (auto& c : sLower) c = towlower(c);
@@ -512,6 +531,11 @@ constexpr UINT kMainAnimInterval = 14;
 
 DWORD gOurClipboardSequence = 0;
 DWORD gLastProcessedClipboardSequence = 0;
+DWORD gPendingClipboardSequence = 0;
+int gClipboardRetryCount = 0;
+uint64_t gLastClipboardImageFingerprint = 0;
+ULONGLONG gLastClipboardImageTick = 0;
+bool gHasClipboardImageFingerprint = false;
 
 HWND gActiveModalHwnd = nullptr;
 int gTargetX = 0;
@@ -712,7 +736,10 @@ void AddClipboardItem(const ClipItem& input) {
         }
     }
 
-    const auto existing = std::find_if(gHistory.begin(), gHistory.end(), [&](const ClipItem& existingItem) { return existingItem.preview == preview && existingItem.source == item.source; });
+    const auto existing = item.type == ClipItem::Type::Image ? gHistory.end() :
+        std::find_if(gHistory.begin(), gHistory.end(), [&](const ClipItem& existingItem) {
+            return existingItem.type == item.type && existingItem.rawContent == item.rawContent && existingItem.source == item.source;
+        });
     bool wasPinned = false;
     if (existing != gHistory.end()) {
         wasPinned = existing->pinned;
@@ -1500,6 +1527,7 @@ void ShowCopiedNotification(const ClipItem& item, const std::wstring& source) {
         wcsncpy_s(notification.szInfoTitle, title.c_str(), _TRUNCATE);
         notification.hBalloonIcon = hNotifIcon;
         notification.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+        gUpdateBalloonActive = false;
         Shell_NotifyIconW(NIM_MODIFY, &notification);
     }
 }
@@ -1540,7 +1568,32 @@ void ShowSoftToast(const std::wstring& body) {
         wcsncpy_s(notification.szInfoTitle, L"ClipTrace", _TRUNCATE);
         notification.hBalloonIcon = gLargeAppIcon ? gLargeAppIcon : gTrayIcon.hIcon;
         notification.dwInfoFlags = NIIF_USER | NIIF_LARGE_ICON;
+        gUpdateBalloonActive = false;
         Shell_NotifyIconW(NIM_MODIFY, &notification);
+    }
+}
+
+void ShowUpdateNotification(HWND hwnd) {
+    if (!gAvailableUpdate) return;
+    const std::wstring message = L"Versão " + gAvailableUpdate->tag + L" disponível. Clique para baixar e instalar.";
+    try {
+        winrt::Windows::Data::Xml::Dom::XmlDocument doc;
+        doc.LoadXml(L"<toast duration=\"long\"><visual><binding template=\"ToastGeneric\"><text>Atualização do ClipTrace</text><text>" +
+            EscapeXml(message) + L"</text></binding></visual></toast>");
+        gUpdateToast = winrt::Windows::UI::Notifications::ToastNotification(doc);
+        gUpdateToast.Activated([hwnd](auto const&, auto const&) {
+            PostMessageW(hwnd, WM_INSTALL_UPDATE, 0, 0);
+        });
+        auto notifier = winrt::Windows::UI::Notifications::ToastNotificationManager::CreateToastNotifier(L"palmeidev.ClipTrace");
+        notifier.Show(gUpdateToast);
+        gUpdateBalloonActive = false;
+    } catch (...) {
+        NOTIFYICONDATAW notification = gTrayIcon;
+        notification.uFlags = NIF_INFO;
+        wcsncpy_s(notification.szInfoTitle, L"Atualização do ClipTrace", _TRUNCATE);
+        wcsncpy_s(notification.szInfo, message.c_str(), _TRUNCATE);
+        notification.dwInfoFlags = NIIF_INFO;
+        gUpdateBalloonActive = Shell_NotifyIconW(NIM_MODIFY, &notification) != FALSE;
     }
 }
 
@@ -1645,19 +1698,64 @@ bool SaveBitmapToFile(HBITMAP hBitmap, const std::wstring& filePath) {
 
     std::vector<BYTE> bits(imageSize);
     HDC screenDc = GetDC(nullptr);
-    GetDIBits(screenDc, hBitmap, 0, bm.bmHeight, bits.data(), reinterpret_cast<BITMAPINFO*>(&bih), DIB_RGB_COLORS);
+    const int scanlines = GetDIBits(screenDc, hBitmap, 0, bm.bmHeight, bits.data(), reinterpret_cast<BITMAPINFO*>(&bih), DIB_RGB_COLORS);
     ReleaseDC(nullptr, screenDc);
+    if (scanlines != bm.bmHeight) return false;
 
     HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (hFile == INVALID_HANDLE_VALUE) return false;
 
     DWORD written = 0;
-    WriteFile(hFile, &bfh, sizeof(bfh), &written, nullptr);
-    WriteFile(hFile, &bih, sizeof(bih), &written, nullptr);
-    WriteFile(hFile, bits.data(), imageSize, &written, nullptr);
-    FlushFileBuffers(hFile);
+    const bool saved = WriteFile(hFile, &bfh, sizeof(bfh), &written, nullptr) && written == sizeof(bfh) &&
+        WriteFile(hFile, &bih, sizeof(bih), &written, nullptr) && written == sizeof(bih) &&
+        WriteFile(hFile, bits.data(), imageSize, &written, nullptr) && written == imageSize &&
+        FlushFileBuffers(hFile);
     CloseHandle(hFile);
+    if (!saved) DeleteFileW(filePath.c_str());
+    return saved;
+}
+
+bool GetBitmapFingerprint(HBITMAP bitmap, uint64_t& fingerprint) {
+    BITMAP details{};
+    if (!bitmap || !GetObjectW(bitmap, sizeof(details), &details) || details.bmWidth <= 0 || details.bmHeight <= 0) return false;
+    const size_t byteCount = static_cast<size_t>(details.bmWidth) * static_cast<size_t>(details.bmHeight) * 4;
+    if (byteCount > 512ULL * 1024 * 1024) return false;
+
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = details.bmWidth;
+    info.bmiHeader.biHeight = details.bmHeight;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    std::vector<BYTE> pixels(byteCount);
+    HDC dc = GetDC(nullptr);
+    if (!dc) return false;
+    const int lines = GetDIBits(dc, bitmap, 0, details.bmHeight, pixels.data(), &info, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, dc);
+    if (lines != details.bmHeight) return false;
+
+    uint64_t hash = 14695981039346656037ULL;
+    for (BYTE value : pixels) {
+        hash ^= value;
+        hash *= 1099511628211ULL;
+    }
+    hash ^= static_cast<uint32_t>(details.bmWidth);
+    hash *= 1099511628211ULL;
+    hash ^= static_cast<uint32_t>(details.bmHeight);
+    fingerprint = hash;
     return true;
+}
+
+bool IsRepeatedClipboardImage(HBITMAP bitmap, ULONGLONG now) {
+    uint64_t fingerprint = 0;
+    if (!GetBitmapFingerprint(bitmap, fingerprint)) return false;
+    const bool repeated = gHasClipboardImageFingerprint &&
+        now - gLastClipboardImageTick <= 350 && fingerprint == gLastClipboardImageFingerprint;
+    gLastClipboardImageFingerprint = fingerprint;
+    gLastClipboardImageTick = now;
+    gHasClipboardImageFingerprint = true;
+    return repeated;
 }
 
 bool SaveBitmapToTempFile(HBITMAP hBitmap, std::wstring& outPath) {
@@ -1707,13 +1805,14 @@ void OpenImageExternal(const ClipItem& item) {
     ShowSoftToast(L"Não foi possível abrir a imagem.");
 }
 
-void WriteStorageString(HANDLE hFile, const std::wstring& str) {
+bool WriteStorageString(HANDLE hFile, const std::wstring& str) {
     uint32_t len = static_cast<uint32_t>(str.size());
     DWORD written = 0;
-    WriteFile(hFile, &len, sizeof(len), &written, nullptr);
+    if (!WriteFile(hFile, &len, sizeof(len), &written, nullptr) || written != sizeof(len)) return false;
     if (len > 0) {
-        WriteFile(hFile, str.data(), len * sizeof(wchar_t), &written, nullptr);
+        if (!WriteFile(hFile, str.data(), len * sizeof(wchar_t), &written, nullptr) || written != len * sizeof(wchar_t)) return false;
     }
+    return true;
 }
 
 bool ReadStorageString(HANDLE hFile, std::wstring& str) {
@@ -1742,29 +1841,31 @@ void SaveHistoryToDisk() {
     const uint32_t kVersion = 1;
     uint32_t count = static_cast<uint32_t>(gHistory.size());
 
-    WriteFile(hFile, &kMagic, sizeof(kMagic), &written, nullptr);
-    WriteFile(hFile, &kVersion, sizeof(kVersion), &written, nullptr);
-    WriteFile(hFile, &count, sizeof(count), &written, nullptr);
+    bool saved = WriteFile(hFile, &kMagic, sizeof(kMagic), &written, nullptr) && written == sizeof(kMagic) &&
+        WriteFile(hFile, &kVersion, sizeof(kVersion), &written, nullptr) && written == sizeof(kVersion) &&
+        WriteFile(hFile, &count, sizeof(count), &written, nullptr) && written == sizeof(count);
 
     for (const auto& item : gHistory) {
-        WriteFile(hFile, &item.copiedAt, sizeof(SYSTEMTIME), &written, nullptr);
+        if (!saved) break;
+        saved = WriteFile(hFile, &item.copiedAt, sizeof(SYSTEMTIME), &written, nullptr) && written == sizeof(SYSTEMTIME);
         uint32_t typeVal = static_cast<uint32_t>(item.type);
-        WriteFile(hFile, &typeVal, sizeof(typeVal), &written, nullptr);
+        saved = saved && WriteFile(hFile, &typeVal, sizeof(typeVal), &written, nullptr) && written == sizeof(typeVal);
         uint32_t pinnedVal = item.pinned ? 1 : 0;
-        WriteFile(hFile, &pinnedVal, sizeof(pinnedVal), &written, nullptr);
+        saved = saved && WriteFile(hFile, &pinnedVal, sizeof(pinnedVal), &written, nullptr) && written == sizeof(pinnedVal);
 
-        WriteStorageString(hFile, item.preview);
-        WriteStorageString(hFile, item.rawContent);
-        WriteStorageString(hFile, item.source);
-        WriteStorageString(hFile, item.pageTitle);
-        WriteStorageString(hFile, item.pageUrl);
-        WriteStorageString(hFile, item.imageFile);
+        saved = saved && WriteStorageString(hFile, item.preview) &&
+            WriteStorageString(hFile, item.rawContent) &&
+            WriteStorageString(hFile, item.source) &&
+            WriteStorageString(hFile, item.pageTitle) &&
+            WriteStorageString(hFile, item.pageUrl) &&
+            WriteStorageString(hFile, item.imageFile);
     }
 
-    FlushFileBuffers(hFile);
+    if (saved) saved = FlushFileBuffers(hFile) != 0;
     CloseHandle(hFile);
 
-    MoveFileExW(tmpPath.c_str(), datPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (saved) saved = MoveFileExW(tmpPath.c_str(), datPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+    if (!saved) DeleteFileW(tmpPath.c_str());
 }
 
 void LoadHistoryFromDisk() {
@@ -1838,6 +1939,7 @@ void LoadSettings() {
 
     int startWin = GetPrivateProfileIntW(L"General", L"StartWithWindows", 1, iniPath.c_str());
     gStartWithWindows = (startWin != 0);
+    gReplaceWinV = GetPrivateProfileIntW(L"General", L"ReplaceWinV", 0, iniPath.c_str()) != 0;
 
     int retention = GetPrivateProfileIntW(L"General", L"Retention", 0, iniPath.c_str());
     if (retention >= 0 && retention <= 4) {
@@ -1858,6 +1960,52 @@ void SaveSettings() {
 
     swprintf_s(buf, L"%d", static_cast<int>(gRetentionSetting));
     WritePrivateProfileStringW(L"General", L"Retention", buf, iniPath.c_str());
+    swprintf_s(buf, L"%d", gReplaceWinV ? 1 : 0);
+    WritePrivateProfileStringW(L"General", L"ReplaceWinV", buf, iniPath.c_str());
+}
+
+LRESULT CALLBACK WinVKeyboardProc(int code, WPARAM message, LPARAM data) {
+    if (code == HC_ACTION) {
+        const auto* key = reinterpret_cast<const KBDLLHOOKSTRUCT*>(data);
+        const bool down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+        const bool up = message == WM_KEYUP || message == WM_SYSKEYUP;
+        if (key->vkCode == VK_LWIN || key->vkCode == VK_RWIN) {
+            if (down) gWinKeyDown = true;
+            if (up) gWinKeyDown = false;
+        } else if (key->vkCode == VK_LCONTROL || key->vkCode == VK_RCONTROL || key->vkCode == VK_CONTROL) {
+            if (down) gCtrlDown = true;
+            if (up) gCtrlDown = false;
+        } else if (key->vkCode == VK_LMENU || key->vkCode == VK_RMENU || key->vkCode == VK_MENU) {
+            if (down) gAltDown = true;
+            if (up) gAltDown = false;
+        } else if (key->vkCode == 'V') {
+            if (down && gWinVDown) return 1;
+            if (down && gWinKeyDown && !gCtrlDown && !gAltDown) {
+                if (!gWinVDown && gMainWindow) PostMessageW(gMainWindow, WM_OPEN_CLIPTRACE, 0, 0);
+                gWinVDown = true;
+                return 1;
+            }
+            if (up && gWinVDown) {
+                gWinVDown = false;
+                return 1;
+            }
+        }
+    }
+    return CallNextHookEx(gWinVHook, code, message, data);
+}
+
+bool SetWinVReplacement(bool enable) {
+    if (enable) {
+        if (!gWinVHook) gWinVHook = SetWindowsHookExW(WH_KEYBOARD_LL, WinVKeyboardProc, GetModuleHandleW(nullptr), 0);
+        return gWinVHook != nullptr;
+    }
+    if (gWinVHook) UnhookWindowsHookEx(gWinVHook);
+    gWinVHook = nullptr;
+    gWinKeyDown = false;
+    gWinVDown = false;
+    gCtrlDown = false;
+    gAltDown = false;
+    return true;
 }
 
 bool IsAutoStartEnabled() {
@@ -2415,6 +2563,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
         stepVal(state->closeHoverProgress, state->closeHovered ? 1.0f : 0.0f);
         stepVal(state->clearHoverProgress, state->clearHovered ? 1.0f : 0.0f);
         stepVal(state->switchHoverProgress, state->switchHovered ? 1.0f : 0.0f);
+        stepVal(state->winVHoverProgress, state->winVHovered ? 1.0f : 0.0f);
 
         for (int i = 0; i < 5; ++i) {
             stepVal(state->tabHoverProgress[i], state->tabHovered == i ? 1.0f : 0.0f);
@@ -2426,6 +2575,13 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
             animating = true;
         } else {
             state->switchToggleProgress = targetSwitch;
+        }
+        const float targetWinV = gReplaceWinV ? 1.0f : 0.0f;
+        if (std::abs(state->winVToggleProgress - targetWinV) > 0.005f) {
+            state->winVToggleProgress += (targetWinV - state->winVToggleProgress) * 0.25f;
+            animating = true;
+        } else {
+            state->winVToggleProgress = targetWinV;
         }
 
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -2579,6 +2735,24 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
         RECT thumbRect = {thumbX, thumbY, thumbX + 20, thumbY + 20};
         FillRoundedRect(dc, thumbRect, 10, RGB(255, 255, 255));
 
+        RECT winVCard = {20, 438, client.right - 20, 520};
+        state->winVRowRect = winVCard;
+        FillRoundedRect(dc, winVCard, 8, kCardBackground);
+        DrawTextLine(dc, L"Usar ClipTrace com Win + V", {winVCard.left + 16, winVCard.top + 16, winVCard.right - 80, winVCard.top + 38}, gBodyFont, kText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        DrawTextLine(dc, L"Abre o ClipTrace no lugar do histórico do Windows.", {winVCard.left + 16, winVCard.top + 38, winVCard.right - 80, winVCard.top + 58}, gSmallFont, kMuted, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        state->winVSwitchRect = {winVCard.right - 66, winVCard.top + 26, winVCard.right - 18, winVCard.top + 54};
+        const COLORREF winVSwitchBg = LerpColor(RGB(48, 58, 78), RGB(0, 120, 215), state->winVToggleProgress);
+        FillRoundedRect(dc, state->winVSwitchRect, 14, LerpColor(winVSwitchBg, RGB(35, 145, 240), state->winVHoverProgress * state->winVToggleProgress));
+        HPEN winVPen = CreatePen(PS_SOLID, 1, LerpColor(RGB(75, 90, 115), kAccent, state->winVToggleProgress));
+        HGDIOBJ oldWinVPen = SelectObject(dc, winVPen);
+        HGDIOBJ oldWinVBrush = SelectObject(dc, GetStockObject(HOLLOW_BRUSH));
+        RoundRect(dc, state->winVSwitchRect.left, state->winVSwitchRect.top, state->winVSwitchRect.right, state->winVSwitchRect.bottom, 14, 14);
+        SelectObject(dc, oldWinVBrush);
+        SelectObject(dc, oldWinVPen);
+        DeleteObject(winVPen);
+        const int winVThumbX = state->winVSwitchRect.left + 4 + static_cast<int>(20 * state->winVToggleProgress);
+        FillRoundedRect(dc, {winVThumbX, state->winVSwitchRect.top + 4, winVThumbX + 20, state->winVSwitchRect.top + 24}, 10, RGB(255, 255, 255));
+
         BitBlt(realDc, 0, 0, width, height, dc, 0, 0, SRCCOPY);
         SelectObject(dc, oldMemBitmap);
         DeleteObject(memBitmap);
@@ -2599,12 +2773,14 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
             }
         }
         const bool swHov = IsInside(point, state->autoStartSwitchRect) || IsInside(point, state->autoStartRowRect);
+        const bool winVHov = IsInside(point, state->winVRowRect);
 
-        if (cHov != state->closeHovered || clrHov != state->clearHovered || tHov != state->tabHovered || swHov != state->switchHovered) {
+        if (cHov != state->closeHovered || clrHov != state->clearHovered || tHov != state->tabHovered || swHov != state->switchHovered || winVHov != state->winVHovered) {
             state->closeHovered = cHov;
             state->clearHovered = clrHov;
             state->tabHovered = tHov;
             state->switchHovered = swHov;
+            state->winVHovered = winVHov;
             SetTimer(hwnd, kSettingsAnimTimer, kSettingsAnimInterval, nullptr);
             TRACKMOUSEEVENT tme{sizeof(tme), TME_LEAVE, hwnd, 0};
             TrackMouseEvent(&tme);
@@ -2613,11 +2789,12 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
     }
 
     case WM_MOUSELEAVE: {
-        if (state->closeHovered || state->clearHovered || state->tabHovered != -1 || state->switchHovered) {
+        if (state->closeHovered || state->clearHovered || state->tabHovered != -1 || state->switchHovered || state->winVHovered) {
             state->closeHovered = false;
             state->clearHovered = false;
             state->tabHovered = -1;
             state->switchHovered = false;
+            state->winVHovered = false;
             SetTimer(hwnd, kSettingsAnimTimer, kSettingsAnimInterval, nullptr);
         }
         return 0;
@@ -2627,7 +2804,7 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
         POINT point{};
         GetCursorPos(&point);
         ScreenToClient(hwnd, &point);
-        if (IsInside(point, state->closeRect) || IsInside(point, state->clearHistoryRect) || IsInside(point, state->autoStartRowRect) || IsInside(point, state->autoStartSwitchRect)) {
+        if (IsInside(point, state->closeRect) || IsInside(point, state->clearHistoryRect) || IsInside(point, state->autoStartRowRect) || IsInside(point, state->winVRowRect)) {
             SetCursor(LoadCursorW(nullptr, IDC_HAND));
             return TRUE;
         }
@@ -2679,6 +2856,18 @@ LRESULT CALLBACK SettingsWndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM 
             ShowSoftToast(gStartWithWindows ? L"Inicialização com o Windows ativada." : L"Inicialização com o Windows desativada.");
             return 0;
         }
+        if (IsInside(point, state->winVRowRect)) {
+            const bool enabled = !gReplaceWinV;
+            if (SetWinVReplacement(enabled)) {
+                gReplaceWinV = enabled;
+                SaveSettings();
+                SetTimer(hwnd, kSettingsAnimTimer, kSettingsAnimInterval, nullptr);
+                ShowSoftToast(enabled ? L"Win + V abre o ClipTrace." : L"Win + V restaurado para o Windows.");
+            } else {
+                ShowSoftToast(L"Não foi possível ativar Win + V.");
+            }
+            return 0;
+        }
         return 0;
     }
 
@@ -2704,11 +2893,12 @@ void ShowSettings(HWND hwnd) {
     auto* state = new SettingsDialogState{};
     state->owner = hwnd;
     state->switchToggleProgress = gStartWithWindows ? 1.0f : 0.0f;
+    state->winVToggleProgress = gReplaceWinV ? 1.0f : 0.0f;
 
     RECT ownerRect{};
     GetWindowRect(hwnd, &ownerRect);
     constexpr int dialogWidth = 500;
-    constexpr int dialogHeight = 450;
+    constexpr int dialogHeight = 544;
     const int x = ownerRect.left + ((ownerRect.right - ownerRect.left) - dialogWidth) / 2;
     const int y = ownerRect.top + ((ownerRect.bottom - ownerRect.top) - dialogHeight) / 2;
     state->targetX = x;
@@ -3091,9 +3281,7 @@ void ShowAbout(HWND hwnd) {
 }
 
 void CopyItemToClipboard(HWND hwnd, const ClipItem& item) {
-    gIgnoreClipboardUpdate = true;
     if (!OpenClipboard(hwnd)) {
-        gIgnoreClipboardUpdate = false;
         ShowSoftToast(L"Não foi possível acessar a área de transferência.");
         return;
     }
@@ -3116,6 +3304,24 @@ void CopyItemToClipboard(HWND hwnd, const ClipItem& item) {
                 DeleteObject(bitmap);
             }
         }
+    } else if (item.type == ClipItem::Type::File && !item.rawContent.empty()) {
+        std::wstring paths = item.rawContent;
+        std::replace(paths.begin(), paths.end(), L'\n', L'\0');
+        paths.push_back(L'\0');
+        paths.push_back(L'\0');
+        const SIZE_T bytes = sizeof(DROPFILES) + paths.size() * sizeof(wchar_t);
+        HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+        if (memory) {
+            auto* drop = static_cast<DROPFILES*>(GlobalLock(memory));
+            if (drop) {
+                drop->pFiles = sizeof(DROPFILES);
+                drop->fWide = TRUE;
+                memcpy(reinterpret_cast<BYTE*>(drop) + sizeof(DROPFILES), paths.data(), paths.size() * sizeof(wchar_t));
+                GlobalUnlock(memory);
+                copied = SetClipboardData(CF_HDROP, memory) != nullptr;
+            }
+            if (!copied) GlobalFree(memory);
+        }
     } else {
         const size_t bytes = (item.rawContent.size() + 1) * sizeof(wchar_t);
         HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
@@ -3130,21 +3336,20 @@ void CopyItemToClipboard(HWND hwnd, const ClipItem& item) {
         gOurClipboardSequence = GetClipboardSequenceNumber();
         ShowSoftToast(L"Copiado com sucesso!");
     } else {
-        gIgnoreClipboardUpdate = false;
         ShowSoftToast(L"Não foi possível copiar o item.");
     }
 }
 
-void ReadClipboard(HWND hwnd) {
-    if (gMonitoringPaused) return;
-    if (!OpenClipboard(hwnd)) return;
+bool ReadClipboard(HWND hwnd) {
+    if (gMonitoringPaused) return true;
+    if (!OpenClipboard(hwnd)) return false;
 
     const HWND targetWnd = FindTargetWindow();
     const WindowInfo winInfo = GetWindowInfo(targetWnd);
     if (winInfo.isPasswordManager) {
         CloseClipboard();
         ShowSoftToast(L"ClipTrace: Conteúdo protegido ignorado (gerenciador de senhas).");
-        return;
+        return true;
     }
 
     std::wstring pageUrl = UrlFromHtmlClipboard();
@@ -3179,7 +3384,8 @@ void ReadClipboard(HWND hwnd) {
     item.pageUrl = pageUrl;
     item.pageTitle = !tabTitle.empty() ? tabTitle : winInfo.title;
 
-    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+    if (IsClipboardFormatAvailable(CF_UNICODETEXT) && !IsClipboardFormatAvailable(CF_HDROP) &&
+        !IsClipboardFormatAvailable(CF_DIB) && !IsClipboardFormatAvailable(CF_BITMAP)) {
         HGLOBAL data = GetClipboardData(CF_UNICODETEXT);
         const wchar_t* text = data ? static_cast<const wchar_t*>(GlobalLock(data)) : nullptr;
         if (text) {
@@ -3197,14 +3403,21 @@ void ReadClipboard(HWND hwnd) {
         }
     } else if (IsClipboardFormatAvailable(CF_HDROP)) {
         HDROP drop = static_cast<HDROP>(GetClipboardData(CF_HDROP));
-        wchar_t path[MAX_PATH]{};
-        if (drop && DragQueryFileW(drop, 0, path, MAX_PATH)) {
-            item.rawContent = path;
-            item.preview = std::wstring(L"Arquivo: ") + path;
-            std::wstring filePath(path);
-            const size_t s = filePath.find_last_of(L"\\/");
-            if (s != std::wstring::npos) item.pageUrl = filePath.substr(0, s);
+        const UINT count = drop ? DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0) : 0;
+        for (UINT index = 0; index < count; ++index) {
+            const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+            std::wstring path(length + 1, L'\0');
+            if (!DragQueryFileW(drop, index, path.data(), length + 1)) continue;
+            path.resize(length);
+            if (!item.rawContent.empty()) item.rawContent += L'\n';
+            item.rawContent += path;
+            if (item.preview.empty()) {
+                item.preview = L"Arquivo: " + path;
+                const size_t slash = path.find_last_of(L"\\/");
+                if (slash != std::wstring::npos) item.pageUrl = path.substr(0, slash);
+            }
         }
+        if (count > 1 && !item.preview.empty()) item.preview = std::to_wstring(count) + L" arquivos: " + item.preview.substr(9);
         item.type = ClipItem::Type::File;
     } else if (IsClipboardFormatAvailable(CF_DIB) || IsClipboardFormatAvailable(CF_BITMAP)) {
         item.type = ClipItem::Type::Image;
@@ -3224,20 +3437,20 @@ void ReadClipboard(HWND hwnd) {
                 if (bitmapFromDib) item.image = std::shared_ptr<ClipItem::BitmapObject>(bitmapFromDib, [](ClipItem::BitmapObject* bitmap) { DeleteObject(bitmap); });
             }
         }
-    } else {
-        item.preview = L"Conteúdo copiado";
-        item.rawContent = item.preview;
-        item.type = ClipItem::Type::Other;
     }
     CloseClipboard();
+    if (item.preview.empty() || (item.type == ClipItem::Type::Image && !item.image)) return true;
+    if (item.type == ClipItem::Type::Image && IsRepeatedClipboardImage(item.image.get(), GetTickCount64())) return true;
     AddClipboardItem(item);
     ShowCopiedNotification(item, source);
     InvalidateRect(hwnd, nullptr, FALSE);
+    return true;
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
     case WM_CREATE: {
+        gMainWindow = hwnd;
         gTitleFont = CreateFontW(-16, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Variable Display");
         gHeaderFont = CreateFontW(-13, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Variable Display");
         gBodyFont = CreateFontW(-14, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI Variable Text");
@@ -3265,6 +3478,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
         AddClipboardFormatListener(hwnd);
         SetTimer(hwnd, 3, 60000, nullptr);
+        SetTimer(hwnd, 5, 3600000, nullptr);
 
         RegisterHotKey(hwnd, kGlobalHotkeyId, MOD_CONTROL | MOD_SHIFT, 'V');
         RegisterHotKey(hwnd, kGlobalHotkeyId + 1, MOD_ALT, 'V');
@@ -3284,6 +3498,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
     case WM_HOTKEY: {
         if (wParam == kGlobalHotkeyId || wParam == kGlobalHotkeyId + 1) {
+            ClipTraceUpdates::CheckAsync(hwnd);
             if (IsWindowVisible(hwnd) && !gIsClosing) {
                 PostMessageW(hwnd, WM_APP + 1, 0, 0);
             } else {
@@ -3301,6 +3516,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         }
         return 0;
     }
+
+    case WM_OPEN_CLIPTRACE:
+        ClipTraceUpdates::CheckAsync(hwnd);
+        if (gActiveModalHwnd && IsWindow(gActiveModalHwnd)) {
+            ShowWindow(gActiveModalHwnd, SW_SHOW);
+            SetForegroundWindow(gActiveModalHwnd);
+        } else {
+            PostMessageW(hwnd, WM_COMMAND, IDM_TRAY_OPEN, 0);
+        }
+        return 0;
 
     case WM_ACTIVATE:
         if (LOWORD(wParam) == WA_INACTIVE) {
@@ -3331,7 +3556,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_TRAYICON: {
-        if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
+        if (lParam == NIN_BALLOONUSERCLICK && gUpdateBalloonActive) {
+            gUpdateBalloonActive = false;
+            PostMessageW(hwnd, WM_INSTALL_UPDATE, 0, 0);
+        } else if (lParam == NIN_BALLOONHIDE || lParam == NIN_BALLOONTIMEOUT) {
+            gUpdateBalloonActive = false;
+        } else if (lParam == WM_LBUTTONUP || lParam == WM_LBUTTONDBLCLK) {
             RECT workArea{};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
             gTargetX = workArea.left + ((workArea.right - workArea.left) - 440) / 2;
@@ -3347,6 +3577,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             GetCursorPos(&pt);
             HMENU hMenu = CreatePopupMenu();
             AppendMenuW(hMenu, MF_STRING, IDM_TRAY_OPEN, L"Abrir ClipTrace (Ctrl+Shift+V)");
+            if (gAvailableUpdate) AppendMenuW(hMenu, MF_STRING, IDM_TRAY_UPDATE, L"Baixar atualização do ClipTrace");
             AppendMenuW(hMenu, MF_STRING, IDM_TRAY_PAUSE, gMonitoringPaused ? L"Retomar Monitoramento" : L"Pausar Monitoramento (Modo Privado)");
             AppendMenuW(hMenu, MF_STRING, IDM_TRAY_CLEAR, L"Limpar Histórico");
             AppendMenuW(hMenu, MF_STRING, IDM_TRAY_SETTINGS, L"Configurações...");
@@ -3364,6 +3595,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     case WM_COMMAND: {
         UINT id = LOWORD(wParam);
         if (id == IDM_TRAY_OPEN) {
+            ClipTraceUpdates::CheckAsync(hwnd);
             RECT workArea{};
             SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0);
             gTargetX = workArea.left + ((workArea.right - workArea.left) - 440) / 2;
@@ -3374,6 +3606,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             ShowWindow(hwnd, SW_SHOW);
             SetForegroundWindow(hwnd);
             SetTimer(hwnd, 1, 12, nullptr);
+        } else if (id == IDM_TRAY_UPDATE) {
+            PostMessageW(hwnd, WM_INSTALL_UPDATE, 0, 0);
         } else if (id == IDM_TRAY_PAUSE) {
             gMonitoringPaused = !gMonitoringPaused;
             ShowSoftToast(gMonitoringPaused ? L"Monitoramento pausado (Modo Privado)." : L"Monitoramento retomado.");
@@ -3423,14 +3657,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
                 gScrollOffset = 0;
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
-        } else if (ch == VK_ESCAPE) {
-            if (!gSearchQuery.empty()) {
-                gSearchQuery.clear();
-                gScrollOffset = 0;
-                InvalidateRect(hwnd, nullptr, FALSE);
-            } else {
-                PostMessageW(hwnd, WM_APP + 1, 0, 0);
-            }
         } else if (ch >= 32 && ch != 127) {
             gSearchQuery.push_back(ch);
             gScrollOffset = 0;
@@ -3448,6 +3674,27 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             } else {
                 PostMessageW(hwnd, WM_APP + 1, 0, 0);
             }
+            return 0;
+        }
+        if (wParam == VK_UP || wParam == VK_DOWN || wParam == VK_RETURN) {
+            const auto filtered = GetFilteredIndices();
+            if (filtered.empty()) return 0;
+            auto selected = std::find(filtered.begin(), filtered.end(), static_cast<size_t>(gSelectedIndex));
+            size_t position = selected == filtered.end() ? 0 : static_cast<size_t>(selected - filtered.begin());
+            if (wParam == VK_RETURN) {
+                CopyItemToClipboard(hwnd, gHistory[filtered[position]]);
+                return 0;
+            }
+            if (wParam == VK_UP && selected != filtered.end() && position > 0) --position;
+            if (wParam == VK_DOWN && selected != filtered.end() && position + 1 < filtered.size()) ++position;
+            gSelectedIndex = static_cast<int>(filtered[position]);
+            RECT client{};
+            GetClientRect(hwnd, &client);
+            const int viewportHeight = client.bottom - 136;
+            const int cardTop = static_cast<int>(position) * 92;
+            if (cardTop < gScrollOffset) gScrollOffset = cardTop;
+            if (cardTop + 84 > gScrollOffset + viewportHeight) gScrollOffset = cardTop + 84 - viewportHeight;
+            InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
         }
         break;
@@ -3564,9 +3811,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
         return 0;
 
     case WM_TIMER:
+        if (wParam == 5) {
+            ClipTraceUpdates::CheckAsync(hwnd, true);
+            return 0;
+        }
         if (wParam == 3) {
             if (ApplyAutoCleanup()) {
                 InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        if (wParam == 4) {
+            const DWORD seq = GetClipboardSequenceNumber();
+            if (seq != gPendingClipboardSequence || seq == gLastProcessedClipboardSequence) {
+                gPendingClipboardSequence = 0;
+                KillTimer(hwnd, 4);
+            } else if (ReadClipboard(hwnd)) {
+                gLastProcessedClipboardSequence = seq;
+                gPendingClipboardSequence = 0;
+                KillTimer(hwnd, 4);
+            } else if (++gClipboardRetryCount >= 10) {
+                gPendingClipboardSequence = 0;
+                KillTimer(hwnd, 4);
             }
             return 0;
         }
@@ -3693,19 +3959,53 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
     case WM_CLIPBOARDUPDATE: {
         const DWORD seq = GetClipboardSequenceNumber();
-        if (gIgnoreClipboardUpdate || (gOurClipboardSequence != 0 && seq == gOurClipboardSequence)) {
-            gIgnoreClipboardUpdate = false;
+        if (gOurClipboardSequence != 0 && seq == gOurClipboardSequence) {
             gOurClipboardSequence = 0;
             gLastProcessedClipboardSequence = seq;
+            gPendingClipboardSequence = 0;
+            KillTimer(hwnd, 4);
             return 0;
         }
+        gOurClipboardSequence = 0;
         if (seq != 0 && seq == gLastProcessedClipboardSequence) {
             return 0;
         }
-        gLastProcessedClipboardSequence = seq;
-        ReadClipboard(hwnd);
+        if (ReadClipboard(hwnd)) {
+            gLastProcessedClipboardSequence = seq;
+            gPendingClipboardSequence = 0;
+            KillTimer(hwnd, 4);
+        } else {
+            gPendingClipboardSequence = seq;
+            gClipboardRetryCount = 0;
+            SetTimer(hwnd, 4, 100, nullptr);
+        }
         return 0;
     }
+
+    case ClipTraceUpdates::AvailableMessage: {
+        std::unique_ptr<ClipTraceUpdates::Release> release(reinterpret_cast<ClipTraceUpdates::Release*>(lParam));
+        if (release && (!gAvailableUpdate || gAvailableUpdate->tag != release->tag)) {
+            gAvailableUpdate = std::move(release);
+            ShowUpdateNotification(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_INSTALL_UPDATE:
+        if (gAvailableUpdate && ClipTraceUpdates::InstallAsync(hwnd, *gAvailableUpdate)) {
+            ShowSoftToast(L"Baixando e verificando a atualização...");
+        }
+        return 0;
+
+    case ClipTraceUpdates::ErrorMessage: {
+        std::unique_ptr<std::wstring> detail(reinterpret_cast<std::wstring*>(lParam));
+        if (detail) MessageBoxW(hwnd, detail->c_str(), L"Atualização do ClipTrace", MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+        return 0;
+    }
+
+    case ClipTraceUpdates::ReadyMessage:
+        DestroyWindow(hwnd);
+        return 0;
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
@@ -3983,7 +4283,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     }
 
     case WM_DESTROY:
+        gUpdateToast = nullptr;
+        SetWinVReplacement(false);
+        gMainWindow = nullptr;
         KillTimer(hwnd, 3);
+        KillTimer(hwnd, 5);
         UnregisterHotKey(hwnd, kGlobalHotkeyId);
         UnregisterHotKey(hwnd, kGlobalHotkeyId + 1);
         SaveHistoryToDisk();
@@ -4003,6 +4307,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 }
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
+    int helperExitCode = 0;
+    if (ClipTraceUpdates::RunHelperIfRequested(helperExitCode)) return helperExitCode;
+    HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\ClipTrace.SingleInstance");
+    if (!instanceMutex) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        for (int attempt = 0; attempt < 40; ++attempt) {
+            HWND existing = FindWindowW(L"ClipTraceWindow", nullptr);
+            if (existing) {
+                SetForegroundWindow(existing);
+                PostMessageW(existing, WM_OPEN_CLIPTRACE, 0, 0);
+                break;
+            }
+            Sleep(50);
+        }
+        CloseHandle(instanceMutex);
+        return 0;
+    }
     winrt::init_apartment(winrt::apartment_type::single_threaded);
 
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
@@ -4059,6 +4380,11 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (hAppIcon) SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)hAppIcon);
     if (hAppIconSm) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hAppIconSm);
 
+    if (gReplaceWinV && !SetWinVReplacement(true)) {
+        gReplaceWinV = false;
+        SaveSettings();
+    }
+
     BOOL darkMode = TRUE;
     DwmSetWindowAttribute(hwnd, 20, &darkMode, sizeof(darkMode));
     const int roundedCorners = 2;
@@ -4073,6 +4399,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     SetWindowPos(hwnd, nullptr, gTargetX, gTargetY + kAnimationOffset, kWindowWidth, kWindowHeight, SWP_NOZORDER | SWP_NOACTIVATE);
 
     ShowWindow(hwnd, show); UpdateWindow(hwnd);
+    ClipTraceUpdates::CheckAsync(hwnd, true);
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
 
@@ -4080,6 +4407,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     if (gDeveloperBitmap) { delete gDeveloperBitmap; gDeveloperBitmap = nullptr; }
     Gdiplus::GdiplusShutdown(gdiplusToken);
     winrt::uninit_apartment();
+
+    ReleaseMutex(instanceMutex);
+    CloseHandle(instanceMutex);
 
     return 0;
 }
