@@ -39,6 +39,19 @@ jobs:
         run: |
           msbuild ClipTrace.sln /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143 /t:Rebuild
 
+      - name: Sign Binary (Authenticode)
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=Pablo Almeida" -KeySpec Signature -KeyExportPolicy Exportable -HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears(5) -CertStoreLocation "Cert:\CurrentUser\My"
+          $pwd = ConvertTo-SecureString "ClipTrace" -AsPlainText -Force
+          $pfxPath = "$env:TEMP\cert.pfx"
+          Export-PfxCertificate -Cert $cert -FilePath $pfxPath -Password $pwd
+          
+          # Locate signtool
+          $signtool = (Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" | Select-Object -First 1).FullName
+          & $signtool sign /fd SHA256 /f $pfxPath /p "ClipTrace" /tr http://timestamp.digicert.com /td SHA256 "x64\Release\ClipTrace.exe"
+          Remove-Item $pfxPath -Force
+
       - name: Package Artifacts
         shell: pwsh
         run: |
@@ -62,7 +75,8 @@ jobs:
           tag_name: ${{ steps.version.outputs.VERSION }}
           name: ClipTrace ${{ steps.version.outputs.VERSION }}
           draft: false
-          prerelease: ${{ contains(steps.version.outputs.VERSION, 'preview') || contains(steps.version.outputs.VERSION, 'beta') || contains(steps.version.outputs.VERSION, 'rc') }}
+          prerelease: false
+          make_latest: true
           generate_release_notes: true
           files: |
             dist/ClipTrace.exe
