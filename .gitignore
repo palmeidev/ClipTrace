@@ -1,0 +1,41 @@
+# Visual Studio / MSVC cache and temporary files
+.vs/
+*.user
+*.userosscache
+*.suo
+*.sln.docstates
+*.VC.db
+*.VC.opendb
+*.opendb
+
+# Build output directories
+x64/
+x86/
+Debug/
+Release/
+ClipTrace/x64/
+ClipTrace/Debug/
+ClipTrace/Release/
+build/
+bin/
+obj/
+dist/
+
+# Compiler and Linker artifacts
+*.obj
+*.ilk
+*.pdb
+*.tlog
+*.lastbuildstate
+*.res
+*.idb
+*.ipdb
+*.iobj
+*.log
+*.recipe
+*.manifest
+
+# Windows system files
+[Dd]esktop.ini
+[Tt]humbs.db
+$RECYCLE.BIN/
